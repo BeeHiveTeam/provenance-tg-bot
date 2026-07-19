@@ -40,6 +40,7 @@ VALCONS  = CFG.get("VALCONS", "").strip()
 CHECK_INTERVAL = int(CFG.get("CHECK_INTERVAL", "60"))
 DISK_WARN_PCT  = int(CFG.get("DISK_WARN_PCT", "85"))
 MISSED_WARN    = int(CFG.get("MISSED_WARN", "500"))
+STALL_TICKS    = int(CFG.get("STALL_TICKS", "3"))   # тиков подряд без роста высоты до алерта
 MISSED_CRIT    = int(CFG.get("MISSED_CRIT", "1500"))
 PEERS_MIN      = int(CFG.get("PEERS_MIN", "3"))
 LAG_WARN       = int(CFG.get("BLOCK_LAG_WARN_SEC", "30"))
@@ -269,12 +270,20 @@ def monitor(st):
             if behind and not st.get("behind"): A.append("🟡 Отставание блока: lag %ds" % s["lag"])
             elif not behind and st.get("behind"): A.append("✅ lag в норме (%ds)" % s["lag"])
             st["behind"] = behind
-        # block stall (height not advancing)
+        # block stall (height not advancing) — STALL_TICKS тиков подряд, не с одного
+        # замера: одиночное совпадение высот ложнит при рестарте бота (первый тик
+        # нового процесса стартует через секунды после последнего тика старого)
         ph = st.get("height")
         if ph is not None and s["height"] is not None and s["height"] == ph and not rpc_dead:
-            if not st.get("stalled"): A.append("🔴 БЛОКИ НЕ РАСТУТ: высота застряла на %s" % s["height"])
-            st["stalled"] = True
+            st["stall_ticks"] = st.get("stall_ticks", 0) + 1
+            if st["stall_ticks"] >= STALL_TICKS and not st.get("stalled"):
+                A.append("🔴 БЛОКИ НЕ РАСТУТ: высота застряла на %s (~%d мин)"
+                         % (s["height"], st["stall_ticks"] * CHECK_INTERVAL // 60))
+                st["stalled"] = True
         else:
+            if st.get("stalled"):
+                A.append("✅ Блоки снова растут: %s" % s["height"])
+            st["stall_ticks"] = 0
             st["stalled"] = False
         st["height"] = s["height"]
         # voting power drop
