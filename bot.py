@@ -57,12 +57,31 @@ def tg(method, params=None, timeout=35):
         sys.stderr.write("tg %s error: %s\n" % (method, e)); return None
 
 def send(chat_id, text):
+    ok = True
     for i in range(0, len(text), 3900):
-        tg("sendMessage", {"chat_id": chat_id, "text": text[i:i+3900],
-                           "disable_web_page_preview": "true"})
+        r = tg("sendMessage", {"chat_id": chat_id, "text": text[i:i+3900],
+                               "disable_web_page_preview": "true"})
+        if not (r and r.get("ok")):
+            ok = False
+    return ok
 
-def broadcast(text):
-    for cid in ALLOWED: send(cid, text)
+def broadcast(text, st=None):
+    for cid in ALLOWED:
+        if send(cid, text):
+            sys.stderr.write("alert delivered to %s: %s\n" % (cid, text.splitlines()[0][:60]))
+        elif st is not None:
+            st.setdefault("pending_alerts", []).append({"cid": cid, "text": text})
+            sys.stderr.write("alert QUEUED (send failed) for %s\n" % cid)
+
+def retry_pending(st):
+    pend = st.get("pending_alerts") or []
+    if not pend:
+        return
+    left = []
+    for a in pend[:20]:
+        if not send(a["cid"], "(повтор) " + a["text"]):
+            left.append(a)
+    st["pending_alerts"] = left + pend[20:]
 
 # ---------- helpers ----------
 def sh(cmd, timeout=15):
@@ -280,7 +299,22 @@ def monitor(st):
         if warn and not st.get("disk_warn"): A.append("🟡 ДИСК /: %d%% (%s ГБ свободно)" % (d["pct"], d["avail_gb"]))
         elif not warn and st.get("disk_warn"): A.append("✅ Диск ок: %d%%" % d["pct"])
         st["disk_warn"] = warn
-    if A: broadcast("\n\n".join(A))
+    # РЕ-АЛЕРТ критических состояний каждые 30 мин (урок инцидента 2026-07-19)
+    now = time.time()
+    crit = []
+    if st.get("jailed"):     crit.append("🔴🔴 ВАЛИДАТОР ВСЁ ЕЩЁ В ДЖЕЙЛЕ")
+    if st.get("tombstoned"): crit.append("💀 TOMBSTONED")
+    if st.get("stalled"):    crit.append("🔴 Блоки всё ещё не растут (%s)" % st.get("height"))
+    if st.get("rpc_dead"):   crit.append("🔴 RPC :26657 всё ещё не отвечает")
+    if st.get("active") is False: crit.append("🔴 provenanced всё ещё down")
+    if crit:
+        if now - st.get("last_realert", 0) >= 1800:
+            A.append("⏰ НАПОМИНАНИЕ (повтор каждые 30 мин):\n" + "\n".join(crit))
+            st["last_realert"] = now
+    else:
+        st["last_realert"] = 0
+    if A: broadcast("\n\n".join(A), st)
+    retry_pending(st)
     save_state(st)
 
 # ---------- commands ----------
