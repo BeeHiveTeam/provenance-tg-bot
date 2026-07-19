@@ -354,7 +354,11 @@ def handle(msg):
 def handle_callback(cb):
     # нажатие инлайн-кнопки: гасим "часики" и выполняем как команду
     cid = str(cb.get("message", {}).get("chat", {}).get("id", ""))
-    tg("answerCallbackQuery", {"callback_query_id": cb.get("id", "")}, timeout=10)
+    r = tg("answerCallbackQuery", {"callback_query_id": cb.get("id", "")}, timeout=10)
+    if not (r and r.get("ok")):
+        # колбэк протух (Telegram принимает ответ ~15-30с после нажатия):
+        # юзер жал давно/серией — не шлём запоздалый ответ, чтобы не спамить чат
+        return
     if cid not in ALLOWED:
         send(cid, "⛔ Не авторизован. Твой chat_id: %s" % cid); return
     dispatch(cid, (cb.get("data") or "").strip().lower())
