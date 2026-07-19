@@ -32,6 +32,8 @@ Companion to [monad-tg-bot](https://github.com/BeeHiveTeam/monad-tg-bot).
 | `/id` | reply with your chat id (for first-time setup) |
 | `/help` | command list |
 
+Every reply and alert comes with inline buttons for the same commands — tap instead of typing.
+
 ## Requirements
 
 - Python 3.8+
