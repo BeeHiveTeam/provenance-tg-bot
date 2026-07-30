@@ -457,6 +457,10 @@ def main():
     monitor(st)
     broadcast("🟢 provenance-tg-bot запущен на %s. /help — команды." % HOST)
     last = time.time()
+    # net_fail ДОЛЖЕН существовать до первой итерации: он инкрементируется в ветке
+    # сетевого сбоя, а обнулялся только в ветках успеха — первый же сбой сразу после
+    # старта давал UnboundLocalError и убивал бота (воспроизведено).
+    net_fail = 0
     while True:
         # allowed_updates явно: настройка ПЕРСИСТЕНТНА на стороне Telegram —
         # без callback_query в списке нажатия кнопок молча не доставляются
