@@ -11,7 +11,7 @@ voting power, sync, peers, the provenanced service, and disk.
 Config: /opt/provenance-tg-bot/config.env   State: /opt/provenance-tg-bot/state.json
 Runs as root (systemctl/journalctl/df + provenanced query). Read-only.
 """
-import json, os, re, ssl, subprocess, sys, time, urllib.parse, urllib.request
+import calendar, json, os, re, ssl, subprocess, sys, time, urllib.parse, urllib.request
 
 CFG_PATH   = "/opt/provenance-tg-bot/config.env"
 STATE_PATH = "/opt/provenance-tg-bot/state.json"
@@ -42,8 +42,12 @@ DISK_WARN_PCT  = int(CFG.get("DISK_WARN_PCT", "85"))
 MISSED_WARN    = int(CFG.get("MISSED_WARN", "500"))
 STALL_TICKS    = int(CFG.get("STALL_TICKS", "3"))   # тиков подряд без роста высоты до алерта
 MISSED_CRIT    = int(CFG.get("MISSED_CRIT", "1500"))
+# Минимальный интервал между алертами «активно пропускает блоки», сек (см. monitor()).
+MISSED_ALERT_MIN_GAP = int(CFG.get("MISSED_ALERT_MIN_GAP", "900"))
 PEERS_MIN      = int(CFG.get("PEERS_MIN", "3"))
 LAG_WARN       = int(CFG.get("BLOCK_LAG_WARN_SEC", "30"))
+PENDING_MAX     = int(CFG.get("PENDING_MAX", "50"))      # максимум недоставленных алертов
+PENDING_TTL_SEC = int(CFG.get("PENDING_TTL_SEC", "21600"))  # 6ч: позже алерт неактуален
 API = "https://api.telegram.org/bot%s/" % TOKEN
 SSLCTX = ssl.create_default_context()
 
@@ -91,7 +95,7 @@ def broadcast(text, st=None):
         if send(cid, text, kb=True):
             sys.stderr.write("alert delivered to %s: %s\n" % (cid, text.splitlines()[0][:60]))
         elif st is not None:
-            st.setdefault("pending_alerts", []).append({"cid": cid, "text": text})
+            st.setdefault("pending_alerts", []).append({"cid": cid, "text": text, "ts": time.time()})
             sys.stderr.write("alert QUEUED (send failed) for %s\n" % cid)
 
 def retry_pending(st):
@@ -102,7 +106,15 @@ def retry_pending(st):
     for a in pend[:20]:
         if not send(a["cid"], "(повтор) " + a["text"], kb=True):
             left.append(a)
-    st["pending_alerts"] = left + pend[20:]
+    # Cap + TTL: очередь не ограничивалась и не истекала. При долгой недоступности
+    # Telegram она росла без предела, а retry_pending() внутри monitor() пытался до 20
+    # отправок по 35с — до ~12 минут блокировки тика: не идёт long-poll (команды не
+    # отвечают) и не выполняются проверки. Старые алерты приезжали через часы без
+    # отметки времени и читались как свежая авария.
+    keep = (left + pend[20:])[-PENDING_MAX:]
+    now = time.time()
+    st["pending_alerts"] = [a for a in keep
+                            if now - float(a.get("ts") or now) <= PENDING_TTL_SEC]
 
 # ---------- helpers ----------
 def sh(cmd, timeout=15):
@@ -135,19 +147,34 @@ def get_status():
     h = si.get("latest_block_height")
     ts = si.get("latest_block_time", "")
     lag = None
-    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", ts or "")
-    if m:
-        try:
-            bt = time.mktime(time.strptime(m.group(1), "%Y-%m-%dT%H:%M:%S")) - time.timezone
-            lag = int(time.time()) - int(bt)
-        except Exception:
-            lag = None
+    # latest_block_time приходит в UTC. `time.mktime() - time.timezone` трактует его как
+    # локальное время и в зоне с DST применяет altzone, вычитая при этом timezone — ошибка
+    # до часа: либо ложное «Отставание блока», либо замаскированный реальный lag.
+    # Здесь хост в UTC, поэтому раньше совпадало случайно.
+    bt = _parse_iso_utc(ts)
+    if bt is not None:
+        lag = int(time.time()) - int(bt)
+    # voting_power: None, если поля validator_info нет вовсе (ранний старт comet).
+    # `int(x or 0)` делал это неотличимым от «выпали из активного сета».
+    vp_raw = vi.get("voting_power")
     return {"height": int(h) if h else None,
             "catching_up": bool(si.get("catching_up")),
-            "vp": int(vi.get("voting_power") or 0),
+            "vp": (int(vp_raw) if str(vp_raw).lstrip("-").isdigit() else None),
             "version": ni.get("version", "?"),
             "network": ni.get("network", "?"),
             "lag": lag}
+
+def _parse_iso_utc(s):
+    """ISO-8601 → epoch (UTC). None если не разобрать."""
+    if not s:
+        return None
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})", s)
+    if not m:
+        return None
+    try:
+        return calendar.timegm(tuple(int(x) for x in m.groups()) + (0, 0, 0))
+    except Exception:
+        return None
 
 def get_signing():
     if not VALCONS:
@@ -157,7 +184,15 @@ def get_signing():
     try:
         i = json.loads(out)["val_signing_info"]
         ju = i.get("jailed_until", "1970-01-01T00:00:00Z")
-        jailed = not ju.startswith("1970")
+        # Cosmos SDK НЕ сбрасывает jailed_until при unjail — там навсегда остаётся дата
+        # прошлого джейла. Прежняя проверка `not ju.startswith("1970")` поэтому считала
+        # «в джейле» любого, кто когда-либо сидел: на живом mainnet это 174 валидатора из 249.
+        # Последствия были каскадные: вечный алерт каждые 30 мин, st["jailed"] навсегда True,
+        # и, что хуже, ВТОРОЙ реальный джейл уже не давал алерта — перехода состояния нет.
+        # Признак джейла = срок в БУДУЩЕМ. Заодно снимается ловушка с «никогда не джейлился»,
+        # который в части версий SDK равен 0001-01-01, а не 1970.
+        ju_ts = _parse_iso_utc(ju)
+        jailed = ju_ts is not None and ju_ts > time.time()
         return {"missed": int(i.get("missed_blocks_counter") or 0),
                 "jailed": jailed, "jailed_until": ju,
                 "tombstoned": bool(i.get("tombstoned"))}
@@ -286,13 +321,20 @@ def monitor(st):
             st["stall_ticks"] = 0
             st["stalled"] = False
         st["height"] = s["height"]
-        # voting power drop
+        # voting power. vp is None = поля validator_info в /status нет (ранний старт comet):
+        # раньше это давало 0 и было неотличимо от «выпали из активного сета» — ложный
+        # алерт на здоровой ноде. И наоборот: при РЕАЛЬНОМ выпадении алерт уходил один раз
+        # (pvp становился 0 и falsy), повторов не было, возврат power не сообщался.
         pvp = st.get("vp")
-        if pvp and s["vp"] and s["vp"] < pvp * 0.9:
-            A.append("⚠️ VOTING POWER упал: %s → %s" % (pvp, s["vp"]))
-        if s["vp"] == 0 and pvp:
-            A.append("🔴 VOTING POWER = 0 (выпали из активного сета / джейл?)")
-        st["vp"] = s["vp"]
+        vp = s["vp"]
+        if vp is not None:
+            if pvp and vp and vp < pvp * 0.9:
+                A.append("⚠️ VOTING POWER упал: %s → %s" % (pvp, vp))
+            if vp == 0 and pvp != 0:
+                A.append("🔴 VOTING POWER = 0 (выпали из активного сета / джейл?)")
+            elif vp > 0 and pvp == 0:
+                A.append("✅ VOTING POWER восстановлен: %s" % vp)
+            st["vp"] = vp
     # validator signing-info
     sg = get_signing()
     if sg:
@@ -310,9 +352,14 @@ def monitor(st):
             A.append("🔴 MISSED BLOCKS = %d (>%d, близко к джейлу 1728!)" % (m, MISSED_CRIT))
         elif m >= MISSED_WARN and (pm is None or pm < MISSED_WARN):
             A.append("🟡 MISSED BLOCKS = %d (>%d)" % (m, MISSED_WARN))
-        # actively missing right now (rose noticeably this tick)
+        # Активный пропуск блоков. Рейт-лимит обязателен: при блоке ~6с валидатор, который не
+        # подписывает, набирает ~10 промахов в минуту, и это условие срабатывало КАЖДЫЙ тик —
+        # 60 сообщений в час, которыми затирается всё остальное, включая джейл-алерт.
         if pm is not None and m - pm >= 10:
-            A.append("🟡 Активно пропускает блоки: +%d за цикл (всего %d)" % (m - pm, m))
+            now = time.time()
+            if now - float(st.get("missed_rate_alert_ts") or 0) >= MISSED_ALERT_MIN_GAP:
+                A.append("🟡 Активно пропускает блоки: +%d за цикл (всего %d)" % (m - pm, m))
+                st["missed_rate_alert_ts"] = now
         st["missed"] = m
     # peers
     p = get_peers()
@@ -335,6 +382,12 @@ def monitor(st):
     if st.get("tombstoned"): crit.append("💀 TOMBSTONED")
     if st.get("stalled"):    crit.append("🔴 Блоки всё ещё не растут (%s)" % st.get("height"))
     if st.get("rpc_dead"):   crit.append("🔴 RPC :26657 всё ещё не отвечает")
+    # missed, застрявший у порога джейла (1728), раньше давал ОДИН алерт и дальше тишину —
+    # в crit-список он не входил, хотя это именно то состояние, о котором надо напоминать.
+    if (st.get("missed") or 0) >= MISSED_CRIT:
+        crit.append("🔴 MISSED BLOCKS всё ещё %d (порог джейла 1728)" % st["missed"])
+    if st.get("vp") == 0:
+        crit.append("🔴 VOTING POWER всё ещё 0 (вне активного сета?)")
     if st.get("active") is False: crit.append("🔴 provenanced всё ещё down")
     if crit:
         if now - st.get("last_realert", 0) >= 1800:
@@ -422,8 +475,16 @@ def main():
                     try: handle_callback(cb)
                     except Exception as e: sys.stderr.write("callback: %s\n" % e)
             save_state(st)
+            net_fail = 0
         elif upd is not None:
             time.sleep(2)  # HTTP-ошибка API (401/409/429): не долбим в busy-loop
+            net_fail = 0
+        else:
+            # upd is None = не-HTTP сбой (DNS, ECONNREFUSED, обрыв). Раньше паузы тут не было
+            # вообще: getaddrinfo падает за доли миллисекунды, и цикл крутился ~155 раз в
+            # секунду — ядро в полке рядом с боевой нодой плюс флуд в journald.
+            net_fail += 1
+            time.sleep(min(2 * (2 ** min(net_fail - 1, 4)), 60))  # 2,4,8,16,32,→60 с
         if time.time() - last >= CHECK_INTERVAL:
             try: monitor(st)
             except Exception as e: sys.stderr.write("monitor: %s\n" % e)
