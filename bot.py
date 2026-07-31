@@ -42,11 +42,17 @@ DISK_WARN_PCT  = int(CFG.get("DISK_WARN_PCT", "85"))
 MISSED_WARN    = int(CFG.get("MISSED_WARN", "500"))
 STALL_TICKS    = int(CFG.get("STALL_TICKS", "3"))   # тиков подряд без роста высоты до алерта
 MISSED_CRIT    = int(CFG.get("MISSED_CRIT", "1500"))
+# Окно slashing и порог джейла Provenance. Раньше 34560/1728 были вписаны прямо в четыре
+# строки сообщений, поэтому при смене параметров сети текст соврал бы, а код продолжил
+# работать по своим порогам — расхождение, которое никто не заметит.
+SLASH_WINDOW = int(os.environ.get("SLASH_WINDOW", "34560"))
+JAIL_THRESHOLD = int(os.environ.get("JAIL_THRESHOLD", "1728"))
 # Минимальный интервал между алертами «активно пропускает блоки», сек (см. monitor()).
 MISSED_ALERT_MIN_GAP = int(CFG.get("MISSED_ALERT_MIN_GAP", "900"))
 # Сколько циклов подряд signing-info должна быть недоступна, прежде чем это станет алертом.
 # Не 1: одиночный таймаут RPC — обычное дело и алертом быть не должен.
 SIGNING_FAIL_ALERT_TICKS = int(os.environ.get("SIGNING_FAIL_ALERT_TICKS", "3"))
+PEERS_FAIL_ALERT_TICKS = int(os.environ.get("PEERS_FAIL_ALERT_TICKS", "5"))
 PEERS_MIN      = int(CFG.get("PEERS_MIN", "3"))
 LAG_WARN       = int(CFG.get("BLOCK_LAG_WARN_SEC", "30"))
 PENDING_MAX     = int(CFG.get("PENDING_MAX", "50"))      # максимум недоставленных алертов
@@ -121,11 +127,32 @@ def retry_pending(st):
 
 # ---------- helpers ----------
 def sh(cmd, timeout=15):
+    """Вывод команды или "" — совместимая обёртка. Для новых проверок брать sh_try."""
+    return sh_try(cmd, timeout)[1]
+
+def sh_try(cmd, timeout=15):
+    """(получилось, вывод). Три состояния вместо двух.
+
+    Прежний sh() возвращал "" и при таймауте, и при успешной команде с пустым выводом.
+    Вызывающий не мог их различить, поэтому «зонд не отработал» читалось как «данных нет,
+    значит всё спокойно». В monad-боте это уже исправлено, сюда не перенесли.
+    """
     try:
-        return subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                              timeout=timeout).stdout.strip()
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
     except Exception:
-        return ""
+        return False, ""
+    return r.returncode == 0, r.stdout.strip()
+
+def sh_args(argv, timeout=15):
+    """Без shell: список аргументов. Значения конфигурации (VALCONS, HOME_DIR, RPC) попадали
+    в строку, исполняемую shell'ом от root — точка с запятой или подстановка в config.env
+    выполнялась бы как команда. Файл наш, но это ровно та ошибка, которую незачем оставлять
+    в публичном репозитории."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return False, ""
+    return r.returncode == 0, r.stdout.strip()
 
 def http_get(path, timeout=6):
     try:
@@ -182,8 +209,10 @@ def _parse_iso_utc(s):
 def get_signing():
     if not VALCONS:
         return None
-    out = sh("provenanced query slashing signing-info %s --home %s --node %s -o json"
-             % (VALCONS, HOME_DIR, RPC))
+    ok, out = sh_args(["provenanced", "query", "slashing", "signing-info", VALCONS,
+                       "--home", HOME_DIR, "--node", RPC, "-o", "json"])
+    if not ok:
+        return None
     try:
         i = json.loads(out)["val_signing_info"]
         ju = i.get("jailed_until", "1970-01-01T00:00:00Z")
@@ -234,7 +263,7 @@ def fmt_status():
         jl = "🔴 ДА" if sg["jailed"] else "✅ нет"
         tb = " 💀tombstoned" if sg["tombstoned"] else ""
         L.append("Jailed: %s%s" % (jl, tb))
-        L.append("Missed blocks: %d / окно 34560 (джейл при >1728)" % sg["missed"])
+        L.append("Missed blocks: %d / окно %d (джейл при >%d)" % (sg["missed"], SLASH_WINDOW, JAIL_THRESHOLD))
     else:
         # Раньше эти строки просто ПРОПАДАЛИ из сводки. Отчёт выглядел здоровым — без единого
         # признака, что джейл и пропущенные блоки не проверялись вообще: не отвечает RPC, нет
@@ -256,9 +285,10 @@ def fmt_val():
     sg = get_signing(); s = get_status()
     if not sg: return "signing-info недоступна (проверь VALCONS/ноду)"
     return ("Валидатор pio-mainnet-1\nJailed: %s\njailed_until: %s\nTombstoned: %s\n"
-            "Missed blocks: %d / 34560 (порог джейла >1728)\nVoting power: %s"
+            "Missed blocks: %d / %d (порог джейла >%d)\nVoting power: %s"
             % ("🔴 ДА" if sg["jailed"] else "✅ нет", sg["jailed_until"],
-               sg["tombstoned"], sg["missed"], s["vp"] if s else "?"))
+               sg["tombstoned"], sg["missed"], SLASH_WINDOW, JAIL_THRESHOLD,
+               s["vp"] if s else "?"))
 
 def fmt_sync():
     s = get_status()
@@ -327,12 +357,19 @@ def monitor(st):
                 A.append("🔴 БЛОКИ НЕ РАСТУТ: высота застряла на %s (~%d мин)"
                          % (s["height"], st["stall_ticks"] * CHECK_INTERVAL // 60))
                 st["stalled"] = True
+        elif s["height"] is None:
+            # Высоты нет — CometBFT ещё поднимается или /status отдал неполный ответ. Раньше
+            # эта ветка сливалась с «высота растёт»: бот слал «✅ Блоки снова растут: None» и
+            # сбрасывал stalled по ОТСУТСТВУЮЩИМ данным, то есть снимал реальный алерт,
+            # ничего не измерив. Состояние не трогаем.
+            pass
         else:
             if st.get("stalled"):
                 A.append("✅ Блоки снова растут: %s" % s["height"])
             st["stall_ticks"] = 0
             st["stalled"] = False
-        st["height"] = s["height"]
+        if s["height"] is not None:
+            st["height"] = s["height"]
         # voting power. vp is None = поля validator_info в /status нет (ранний старт comet):
         # раньше это давало 0 и было неотличимо от «выпали из активного сета» — ложный
         # алерт на здоровой ноде. И наоборот: при РЕАЛЬНОМ выпадении алерт уходил один раз
@@ -361,7 +398,7 @@ def monitor(st):
         m = sg["missed"]; pm = st.get("missed")
         # threshold crossings
         if m >= MISSED_CRIT and (pm is None or pm < MISSED_CRIT):
-            A.append("🔴 MISSED BLOCKS = %d (>%d, близко к джейлу 1728!)" % (m, MISSED_CRIT))
+            A.append("🔴 MISSED BLOCKS = %d (>%d, близко к джейлу %d!)" % (m, MISSED_CRIT, JAIL_THRESHOLD))
         elif m >= MISSED_WARN and (pm is None or pm < MISSED_WARN):
             A.append("🟡 MISSED BLOCKS = %d (>%d)" % (m, MISSED_WARN))
         # Активный пропуск блоков. Рейт-лимит обязателен: при блоке ~6с валидатор, который не
@@ -386,6 +423,15 @@ def monitor(st):
                      "СЕЙЧАС НЕ ПРОВЕРЯЮТСЯ (RPC :26657 / provenanced / VALCONS)" % fails)
     # peers
     p = get_peers()
+    if p is None:
+        # Тот же класс, что PB-2, ставки ниже: /net_info недоступен → проверка пиров молча
+        # пропускается. Раз подряд — не событие, но постоянная слепота должна быть слышна.
+        _pf = int(st.get("peers_fail_ticks") or 0) + 1
+        st["peers_fail_ticks"] = _pf
+        if _pf == PEERS_FAIL_ALERT_TICKS:
+            A.append("⚠️ /net_info недоступен %d циклов — число пиров НЕ проверяется" % _pf)
+    else:
+        st["peers_fail_ticks"] = 0
     if p is not None:
         low = p < PEERS_MIN
         if low and not st.get("peers_low"): A.append("🟡 Мало пиров: %d (<%d)" % (p, PEERS_MIN))
@@ -408,7 +454,7 @@ def monitor(st):
     # missed, застрявший у порога джейла (1728), раньше давал ОДИН алерт и дальше тишину —
     # в crit-список он не входил, хотя это именно то состояние, о котором надо напоминать.
     if (st.get("missed") or 0) >= MISSED_CRIT:
-        crit.append("🔴 MISSED BLOCKS всё ещё %d (порог джейла 1728)" % st["missed"])
+        crit.append("🔴 MISSED BLOCKS всё ещё %d (порог джейла %d)" % (st["missed"], JAIL_THRESHOLD))
     if st.get("vp") == 0:
         crit.append("🔴 VOTING POWER всё ещё 0 (вне активного сета?)")
     if st.get("active") is False: crit.append("🔴 provenanced всё ещё down")

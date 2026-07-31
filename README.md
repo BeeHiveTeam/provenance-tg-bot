@@ -97,3 +97,18 @@ State (Telegram offset + alert de-dup baseline) lives in `/opt/provenance-tg-bot
 ## License
 
 MIT
+
+### Дополнительные ключи конфигурации
+
+Читаются кодом, ранее нигде не были описаны — оператор не мог узнать об их существовании, кроме как из исходника.
+
+| Ключ | Назначение |
+|---|---|
+| `JAIL_THRESHOLD` | см. `config.env.example` |
+| `MISSED_ALERT_MIN_GAP` | см. `config.env.example` |
+| `PEERS_FAIL_ALERT_TICKS` | см. `config.env.example` |
+| `PENDING_MAX` | см. `config.env.example` |
+| `PENDING_TTL_SEC` | см. `config.env.example` |
+| `SIGNING_FAIL_ALERT_TICKS` | см. `config.env.example` |
+| `SLASH_WINDOW` | см. `config.env.example` |
+| `STALL_TICKS` | см. `config.env.example` |
