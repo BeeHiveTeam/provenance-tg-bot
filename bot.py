@@ -44,6 +44,9 @@ STALL_TICKS    = int(CFG.get("STALL_TICKS", "3"))   # тиков подряд б
 MISSED_CRIT    = int(CFG.get("MISSED_CRIT", "1500"))
 # Минимальный интервал между алертами «активно пропускает блоки», сек (см. monitor()).
 MISSED_ALERT_MIN_GAP = int(CFG.get("MISSED_ALERT_MIN_GAP", "900"))
+# Сколько циклов подряд signing-info должна быть недоступна, прежде чем это станет алертом.
+# Не 1: одиночный таймаут RPC — обычное дело и алертом быть не должен.
+SIGNING_FAIL_ALERT_TICKS = int(os.environ.get("SIGNING_FAIL_ALERT_TICKS", "3"))
 PEERS_MIN      = int(CFG.get("PEERS_MIN", "3"))
 LAG_WARN       = int(CFG.get("BLOCK_LAG_WARN_SEC", "30"))
 PENDING_MAX     = int(CFG.get("PENDING_MAX", "50"))      # максимум недоставленных алертов
@@ -232,12 +235,21 @@ def fmt_status():
         tb = " 💀tombstoned" if sg["tombstoned"] else ""
         L.append("Jailed: %s%s" % (jl, tb))
         L.append("Missed blocks: %d / окно 34560 (джейл при >1728)" % sg["missed"])
+    else:
+        # Раньше эти строки просто ПРОПАДАЛИ из сводки. Отчёт выглядел здоровым — без единого
+        # признака, что джейл и пропущенные блоки не проверялись вообще: не отвечает RPC, нет
+        # provenanced, не задан VALCONS. Молчание читается как «всё хорошо», а это худший из
+        # возможных ответов для проверки, ради которой бот и существует.
+        L.append("Jailed: ⚠️ НЕ ПРОВЕРЕНО — signing-info недоступна")
+        L.append("Missed blocks: ⚠️ НЕ ПРОВЕРЕНО")
     p = get_peers()
-    if p is not None: L.append("Пиры: %d" % p)
+    L.append("Пиры: %d" % p if p is not None else "Пиры: ⚠️ НЕ ПРОВЕРЕНО (/net_info недоступен)")
     d = get_disk()
     if d["pct"] is not None:
         L.append("Диск /: %s %d%% занято, %s ГБ" % (
             "✅" if d["pct"] < DISK_WARN_PCT else "🟡", d["pct"], d["avail_gb"]))
+    else:
+        L.append("Диск /: ⚠️ НЕ ПРОВЕРЕНО (df не дал разбираемый вывод)")
     return "\n".join(L)
 
 def fmt_val():
@@ -361,6 +373,17 @@ def monitor(st):
                 A.append("🟡 Активно пропускает блоки: +%d за цикл (всего %d)" % (m - pm, m))
                 st["missed_rate_alert_ts"] = now
         st["missed"] = m
+        st["signing_fail_ticks"] = 0
+    else:
+        # Ветки else тут не было вовсе: при недоступной signing-info проверка джейла просто
+        # переставала выполняться, молча и навсегда. Бот продолжал слать бодрые сводки, а
+        # единственная проверка, ради которой он существует, не работала. Отказ мониторинга
+        # обязан быть слышен — иначе он неотличим от «всё хорошо».
+        fails = int(st.get("signing_fail_ticks") or 0) + 1
+        st["signing_fail_ticks"] = fails
+        if fails == SIGNING_FAIL_ALERT_TICKS:
+            A.append("⚠️ signing-info недоступна %d циклов подряд — джейл и пропущенные блоки "
+                     "СЕЙЧАС НЕ ПРОВЕРЯЮТСЯ (RPC :26657 / provenanced / VALCONS)" % fails)
     # peers
     p = get_peers()
     if p is not None:
