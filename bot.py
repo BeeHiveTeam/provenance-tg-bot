@@ -246,14 +246,35 @@ def get_disk():
     return {"pct": None, "avail_gb": None}
 
 # ---------- reports ----------
+def sync_symbol(s):
+    """
+    Состояние синхронизации по ВОЗРАСТУ БЛОКА, а не по флагу catching_up.
+
+    catching_up=false у CometBFT значит «догоняющая синхронизация не идёт» — это же
+    возвращает и остановившаяся нода: процесса нет, значит false, значит зелёно. Возраст
+    последнего блока — единственный признак, который врать не умеет. Три состояния, а не
+    два: измерили и норма, измерили и отстаём, измерить не смогли.
+
+    Тот же баг был в monad-tg-bot и проявился 2026-08-07: нода стояла на одном блоке,
+    отставая на тысячи, а /status рисовал ✅. Здесь детект в monitor() работает правильно
+    и без этой правки — сломан был только показываемый значок.
+    """
+    if s["lag"] is None:
+        return "❔ lag не измерен"
+    if s["lag"] > LAG_WARN:
+        return "🔴 ОТСТАЁТ"
+    if s["catching_up"]:
+        return "🟡 catching_up"
+    return "✅ в синке"
+
+
 def fmt_status():
     L = ["🔷 Provenance — %s" % HOST]
     L.append("Сервис: " + ("✅ active" if svc_active() else "🔴 НЕ active"))
     s = get_status()
     if s:
         L.append("Сеть: %s  provenanced %s (comet %s)" % (s["network"], app_version(), s["version"]))
-        sync = "✅ у типа" if not s["catching_up"] else "🟡 catching_up"
-        L.append("Синк: %s  блок %s  lag %s" % (sync, s["height"],
+        L.append("Синк: %s  блок %s  lag %s" % (sync_symbol(s), s["height"],
                  "?" if s["lag"] is None else "%ds" % s["lag"]))
         L.append("Voting power: %s" % s["vp"])
     else:
@@ -294,7 +315,7 @@ def fmt_sync():
     s = get_status()
     if not s: return "🔴 RPC :26657 не отвечает"
     return ("Синк %s\nблок: %s\nlag: %s\ncatching_up: %s"
-            % ("✅ у типа" if not s["catching_up"] else "🟡 catching_up",
+            % (sync_symbol(s),
                s["height"], "?" if s["lag"] is None else "%ds" % s["lag"], s["catching_up"]))
 
 def fmt_peers():
