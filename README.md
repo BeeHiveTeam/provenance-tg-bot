@@ -10,6 +10,27 @@ window, voting power, sync, peers, the `provenanced` service, and disk.
 
 Companion to [monad-tg-bot](https://github.com/BeeHiveTeam/monad-tg-bot).
 
+## Install
+
+One line, on the Provenance validator itself:
+
+```
+curl -fsSL https://raw.githubusercontent.com/BeeHiveTeam/provenance-tg-bot/main/install.sh | bash
+```
+
+It checks Python, downloads and compile-checks `bot.py`, asks for the token (never echoed,
+never in shell history), writes `config.env` with mode `600`, and offers to install and start
+the systemd unit — rewriting `User=` and the paths for this machine. Re-running keeps an
+existing config; pass `PROV_FORCE=1` to replace it.
+
+Unattended, or on a box with no terminal:
+
+```
+BOT_TOKEN=... ALLOWED_CHAT_IDS=123456 [INSTALL_SERVICE=1] bash install.sh
+```
+
+Install elsewhere with `PROV_BOT_DIR=/path`.
+
 ## Features
 
 **Push alerts** (sent only on state change, no spam):
