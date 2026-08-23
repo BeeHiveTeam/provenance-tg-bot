@@ -13,6 +13,23 @@ Runs as root (systemctl/journalctl/df + provenanced query). Read-only.
 """
 import calendar, json, os, re, ssl, subprocess, sys, time, urllib.parse, urllib.request
 
+# --- IPv4 вперёд ---------------------------------------------------------------
+# api.telegram.org отдаёт и A, и AAAA. На хосте с глобальным IPv6, у которого маршрут до
+# Telegram не работает, getaddrinfo ставит IPv6 первым, а urllib, в отличие от curl, не умеет
+# Happy Eyeballs: он перебирает адреса по порядку и на каждом ждёт ПОЛНЫЙ таймаут. Замер на
+# нашем хосте: 2 запроса из 20 висли 5.7 и 24.7 с, при IPv4 впереди — 0 из 20. Наружу это
+# выглядит как «бот не отвечает»: висит sendMessage, а не обработчик.
+# Не фильтруем, а переупорядочиваем — на хосте только с IPv6 список останется прежним.
+if os.environ.get("PREFER_IPV4", "1") != "0":
+    import socket as _socket
+    _orig_getaddrinfo = _socket.getaddrinfo
+
+    def _ipv4_first(*args, **kwargs):
+        res = _orig_getaddrinfo(*args, **kwargs)
+        return sorted(res, key=lambda r: 0 if r[0] == _socket.AF_INET else 1)
+
+    _socket.getaddrinfo = _ipv4_first
+
 CFG_PATH   = "/opt/provenance-tg-bot/config.env"
 STATE_PATH = "/opt/provenance-tg-bot/state.json"
 SERVICE = "provenanced"
