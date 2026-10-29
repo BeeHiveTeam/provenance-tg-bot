@@ -11,6 +11,6 @@ jobs:
         run: python3 -m py_compile $(git ls-files '*.py')
       - name: Scripts parse and pass shellcheck (errors)
         run: |
-          files=$(git ls-files | while read -r f; do head -1 "$f" | grep -qE '^#!.*(bash|sh)' && echo "$f"; done)
+          files=$(git ls-files | while read -r f; do if head -1 "$f" | grep -qE '^#!.*(bash|sh)'; then echo "$f"; fi; done)
           for f in $files; do bash -n "$f"; done
           docker run --rm -v "$PWD:/m:ro" -w /m koalaman/shellcheck:stable -S error $files
